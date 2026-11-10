@@ -99,6 +99,10 @@ class PPOAMP(PPO):
         (self.style_rewards, self.disc_score) = self.amp_discriminator.predict_style_reward(
             policy_obs, dt=self.amp_cfg["step_dt"]
         )
+        stand_mask = extras.get("amp_stand_mask")
+        if stand_mask is not None:
+            stand = stand_mask.to(device=self.style_rewards.device, dtype=torch.bool).reshape(-1)
+            self.style_rewards = torch.where(stand, torch.zeros_like(self.style_rewards), self.style_rewards)
         self.rewards_lerp = self.amp_discriminator.lerp_reward(rewards, self.style_rewards)
         self.policy_obs_buffer.append(policy_obs)
         self.expert_obs_buffer.append(expert_obs)

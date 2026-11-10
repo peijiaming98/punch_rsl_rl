@@ -76,6 +76,21 @@ def test_amp_update_and_checkpoint() -> None:
     assert decays == {0.0, 1e-3, 1e-1}
 
 
+def test_stand_mask_removes_style_reward() -> None:
+    """静止环境不再得到行走风格奖励，其余环境保持原奖励。"""
+    alg, obs = build_amp()
+    mask = torch.tensor([True, False, True, False])
+    with torch.no_grad():
+        alg.act(obs)
+        alg.process_env_step(obs, torch.ones(4), torch.zeros(4), {})
+        alg.act(obs)
+        ungated = alg.style_rewards.clone()
+        alg.process_env_step(obs, torch.ones(4), torch.zeros(4), {"amp_stand_mask": mask})
+    torch.testing.assert_close(alg.style_rewards[mask], torch.zeros(2))
+    torch.testing.assert_close(alg.style_rewards[~mask], ungated[~mask])
+    torch.testing.assert_close(alg.rewards_lerp[mask], torch.full((2,), 0.8))
+
+
 def test_terminal_observation_repeats_pre_step_frame() -> None:
     """回合结束时用步进前的策略特征顶替重置后的观测。"""
     alg, obs = build_amp()
