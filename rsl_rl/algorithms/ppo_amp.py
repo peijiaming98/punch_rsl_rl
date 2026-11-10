@@ -183,10 +183,10 @@ class PPOAMP(PPO):
             ))
             updates += 1
         names = (
-            "amp/disc_loss",
-            "amp/disc_grad_penalty",
-            "amp/disc_score",
-            "amp/disc_demo_score",
+            "amp/adversarial_loss",
+            "amp/expert_grad_penalty",
+            "amp/policy_score",
+            "amp/expert_score",
         )
         return dict(zip(names, (totals / max(updates, 1)).tolist()))
 
