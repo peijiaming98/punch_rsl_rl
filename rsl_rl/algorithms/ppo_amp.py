@@ -18,6 +18,7 @@ from __future__ import annotations
 import copy
 import torch
 import torch.nn as nn
+from itertools import chain
 from tensordict import TensorDict
 from typing import Any
 
@@ -26,11 +27,11 @@ from rsl_rl.env import VecEnv
 from rsl_rl.models import MLPModel
 from rsl_rl.modules.amp import AMPDiscriminator, LossType, resolve_amp_config
 from rsl_rl.storage import CircularBuffer, RolloutStorage
-from rsl_rl.utils import resolve_optimizer
+from rsl_rl.utils import reduce_gradients_in_buckets
 
 
 class PPOAMP(PPO):
-    """继承标准 PPO，使用独立优化器训练 AMP 动作判别器。"""
+    """继承标准 PPO，判别器与策略放进同一个 Adam。"""
 
     def __init__(
         self,
@@ -59,20 +60,18 @@ class PPOAMP(PPO):
             device=self.device,
             **amp_cfg.get("amp_discriminator", {}),
         ).to(self.device)
-        self.disc_optimizer = resolve_optimizer("adam")(
-            [
-                {
-                    "params": self.amp_discriminator.disc_trunk.parameters(),
-                    "weight_decay": amp_cfg["disc_trunk_weight_decay"],
-                },
-                {
-                    "params": self.amp_discriminator.disc_linear.parameters(),
-                    "weight_decay": amp_cfg["disc_linear_weight_decay"],
-                },
-            ],
-            lr=amp_cfg["disc_learning_rate"],
-        )
-        self.disc_max_grad_norm = amp_cfg.get("disc_max_grad_norm", 1.0)
+        # 与旧 AMPPPO 相同：判别器和策略共用 Adam，自适应学习率一起变。
+        # 默认主干权重衰减 1e-3，输出层 0.1。判别器梯度不单独裁剪。
+        self.optimizer.add_param_group({
+            "params": list(self.amp_discriminator.disc_trunk.parameters()),
+            "weight_decay": amp_cfg.get("disc_trunk_weight_decay", 10e-4),
+            "lr": self.learning_rate,
+        })
+        self.optimizer.add_param_group({
+            "params": list(self.amp_discriminator.disc_linear.parameters()),
+            "weight_decay": amp_cfg.get("disc_linear_weight_decay", 10e-2),
+            "lr": self.learning_rate,
+        })
         self.policy_obs_buffer = CircularBuffer(amp_cfg["disc_obs_buffer_size"], storage.num_envs, self.device)
         self.expert_obs_buffer = CircularBuffer(amp_cfg["disc_obs_buffer_size"], storage.num_envs, self.device)
         self._reward_statistics = []
@@ -85,19 +84,18 @@ class PPOAMP(PPO):
         cfg["algorithm"]["amp_cfg"]["obs_groups"] = copy.deepcopy(cfg["obs_groups"])
         return PPO.construct_algorithm(obs, env, cfg, device)
 
+    def act(self, obs: TensorDict) -> torch.Tensor:
+        """记下步进前的策略 AMP 特征，供回合结束时重复该帧。"""
+        self._policy_disc_obs = self.amp_discriminator.get_disc_obs(obs).detach()
+        return super().act(obs)
+
     def process_env_step(self, obs: TensorDict, rewards: torch.Tensor, dones: torch.Tensor, extras: dict) -> None:
-        """读取策略和专家历史，用终止前观测替换自动重置状态，组合奖励并保存样本。"""
-        if dones.bool().any() and "final_obs" not in extras:
-            raise ValueError("AMP 自动重置需要 extras['final_obs'] 提供终止前的完整观测。")
+        """读取策略和专家历史。结束的环境用步进前的特征顶替重置后的观测。"""
         policy_obs = self.amp_discriminator.get_disc_obs(obs)
         expert_obs = self.amp_discriminator.get_disc_demo_obs(obs)
-        if "final_obs" in extras:
-            final_obs = extras["final_obs"]
+        if dones.bool().any():
             mask = dones.to(policy_obs.device).bool().reshape(-1, 1, 1)
-            final_policy_obs = self.amp_discriminator.get_disc_obs(final_obs).to(policy_obs.device)
-            final_expert_obs = self.amp_discriminator.get_disc_demo_obs(final_obs).to(expert_obs.device)
-            policy_obs = torch.where(mask, final_policy_obs, policy_obs)
-            expert_obs = torch.where(mask, final_expert_obs, expert_obs)
+            policy_obs = torch.where(mask, self._policy_disc_obs.to(policy_obs.device), policy_obs)
         (self.style_rewards, self.disc_score) = self.amp_discriminator.predict_style_reward(
             policy_obs, dt=self.amp_cfg["step_dt"]
         )
@@ -117,9 +115,26 @@ class PPOAMP(PPO):
         super().process_env_step(obs, self.rewards_lerp, dones, extras)
 
     def update(self) -> dict[str, float]:
-        """复用标准 PPO 更新，再独立更新判别器，返回训练指标。"""
+        """与 PPO 同一次反向传播更新判别器，返回训练指标。"""
+        generators = [
+            buffer.mini_batch_generator(
+                self.storage.num_transitions_per_env,
+                self.num_mini_batches,
+                self.num_learning_epochs,
+            )
+            for buffer in (self.policy_obs_buffer, self.expert_obs_buffer)
+        ]
+        self._disc_batch_iter = zip(*generators, strict=True)
+        self._disc_totals = torch.zeros(4, device=self.device)
+        self._disc_updates = 0
         metrics = super().update()
-        metrics.update(self._update_discriminator())
+        names = (
+            "amp/adversarial_loss",
+            "amp/expert_grad_penalty",
+            "amp/policy_score",
+            "amp/expert_score",
+        )
+        metrics.update(dict(zip(names, (self._disc_totals / max(self._disc_updates, 1)).tolist())))
         if self._reward_statistics:
             means = torch.stack(self._reward_statistics).mean(0).tolist()
             metrics.update(
@@ -133,62 +148,47 @@ class PPOAMP(PPO):
             self._reward_statistics.clear()
         return metrics
 
-    def _update_discriminator(self) -> dict[str, float]:
-        """从策略和专家缓冲区采样，优化分类损失与零中心梯度惩罚。"""
-        generators = [
-            buffer.mini_batch_generator(
-                self.storage.num_transitions_per_env,
-                self.num_mini_batches,
-                self.num_learning_epochs,
+    def auxiliary_loss(self) -> torch.Tensor:
+        """计算与旧 AMPPPO 相同的判别器损失，并加入同一次反向传播。"""
+        policy_obs, expert_obs = next(self._disc_batch_iter)
+        with torch.no_grad():
+            policy_obs_norm = self.amp_discriminator.normalize_disc_obs(policy_obs)
+            expert_obs_norm = self.amp_discriminator.normalize_disc_obs(expert_obs)
+        self._pending_norm = (policy_obs_norm, expert_obs_norm)
+        batch_size = policy_obs.shape[0]
+        policy_score = self.amp_discriminator(policy_obs_norm.reshape(batch_size, -1))
+        expert_score = self.amp_discriminator(expert_obs_norm.reshape(batch_size, -1))
+        if self.loss_type == LossType.GAN:
+            loss = 0.5 * (
+                nn.functional.binary_cross_entropy_with_logits(policy_score, torch.zeros_like(policy_score))
+                + nn.functional.binary_cross_entropy_with_logits(expert_score, torch.ones_like(expert_score))
             )
-            for buffer in (self.policy_obs_buffer, self.expert_obs_buffer)
-        ]
-        totals = torch.zeros(4, device=self.device)
-        updates = 0
-        for policy_obs, expert_obs in zip(*generators):
-            with torch.no_grad():
-                policy_obs_norm = self.amp_discriminator.normalize_disc_obs(policy_obs)
-                expert_obs_norm = self.amp_discriminator.normalize_disc_obs(expert_obs)
-            batch_size = policy_obs.shape[0]
-            policy_score = self.amp_discriminator(policy_obs_norm.reshape(batch_size, -1))
-            expert_score = self.amp_discriminator(expert_obs_norm.reshape(batch_size, -1))
-            if self.loss_type == LossType.GAN:
-                loss = 0.5 * (
-                    nn.functional.binary_cross_entropy_with_logits(policy_score, torch.zeros_like(policy_score))
-                    + nn.functional.binary_cross_entropy_with_logits(expert_score, torch.ones_like(expert_score))
-                )
-            elif self.loss_type == LossType.LSGAN:
-                loss = 0.5 * (
-                    nn.functional.mse_loss(policy_score, -torch.ones_like(policy_score))
-                    + nn.functional.mse_loss(expert_score, torch.ones_like(expert_score))
-                )
-            else:
-                loss = policy_score.mean() - expert_score.mean()
-            penalty = self.amp_discriminator.compute_grad_penalty(
-                expert_obs_norm.reshape(batch_size, -1),
-                self.amp_cfg["grad_penalty_scale"],
+        elif self.loss_type == LossType.LSGAN:
+            loss = 0.5 * (
+                nn.functional.mse_loss(policy_score, -torch.ones_like(policy_score))
+                + nn.functional.mse_loss(expert_score, torch.ones_like(expert_score))
             )
-            self.disc_optimizer.zero_grad()
-            (loss + penalty).backward()
-            if self.is_multi_gpu:
-                self._reduce_discriminator_gradients()
-            nn.utils.clip_grad_norm_(self.amp_discriminator.parameters(), self.disc_max_grad_norm)
-            self.disc_optimizer.step()
-            self.amp_discriminator.update_normalization(policy_obs)
-            totals += torch.stack((
-                loss.detach(),
-                penalty.detach(),
-                policy_score.detach().mean(),
-                expert_score.detach().mean(),
-            ))
-            updates += 1
-        names = (
-            "amp/adversarial_loss",
-            "amp/expert_grad_penalty",
-            "amp/policy_score",
-            "amp/expert_score",
+        else:
+            loss = policy_score.mean() - expert_score.mean()
+        # 梯度惩罚打在归一化之前的专家特征上，系数沿用配置里的 10。
+        penalty = self.amp_discriminator.compute_grad_penalty(
+            expert_obs.reshape(batch_size, -1),
+            self.amp_cfg["grad_penalty_scale"],
         )
-        return dict(zip(names, (totals / max(updates, 1)).tolist()))
+        self._disc_totals += torch.stack((
+            loss.detach(),
+            penalty.detach(),
+            policy_score.detach().mean(),
+            expert_score.detach().mean(),
+        ))
+        self._disc_updates += 1
+        return loss + penalty
+
+    def after_auxiliary_step(self) -> None:
+        """用本批已经归一化的策略和专家特征更新统计量。"""
+        policy_obs_norm, expert_obs_norm = self._pending_norm
+        self.amp_discriminator.update_normalization(policy_obs_norm)
+        self.amp_discriminator.update_normalization(expert_obs_norm)
 
     def train_mode(self) -> None:
         """将 PPO 和判别器切换到训练模式。"""
@@ -201,20 +201,17 @@ class PPOAMP(PPO):
         self.amp_discriminator.eval()
 
     def save(self) -> dict:
-        """保存标准 PPO 状态及 AMP 判别器和优化器状态。"""
+        """保存标准 PPO 状态和 AMP 判别器。判别器动量在共享优化器里。"""
         return dict(
             super().save(),
             amp_discriminator_state_dict=self.amp_discriminator.state_dict(),
-            amp_discriminator_optimizer_state_dict=self.disc_optimizer.state_dict(),
         )
 
     def load(self, loaded_dict: dict, load_cfg: dict | None, strict: bool) -> bool:
-        """按加载选项恢复 PPO 和 AMP 状态，返回是否恢复训练迭代数。"""
+        """按加载选项恢复 PPO 和 AMP 判别器，返回是否恢复训练迭代数。"""
         load_iteration = super().load(loaded_dict, load_cfg, strict)
         if load_cfg is None or load_cfg.get("amp", False):
             self.amp_discriminator.load_state_dict(loaded_dict["amp_discriminator_state_dict"], strict=strict)
-            if load_cfg is None or load_cfg.get("optimizer", False):
-                self.disc_optimizer.load_state_dict(loaded_dict["amp_discriminator_optimizer_state_dict"])
         return load_iteration
 
     def broadcast_parameters(self) -> None:
@@ -224,9 +221,13 @@ class PPOAMP(PPO):
         torch.distributed.broadcast_object_list(state, src=0)
         self.amp_discriminator.load_state_dict(state[0])
 
-    def _reduce_discriminator_gradients(self) -> None:
-        """对判别器梯度进行跨进程平均。"""
-        for parameter in self.amp_discriminator.parameters():
-            if parameter.grad is not None:
-                torch.distributed.all_reduce(parameter.grad, op=torch.distributed.ReduceOp.SUM)
-                parameter.grad.div_(self.gpu_world_size)
+    def reduce_parameters(self) -> None:
+        """跨进程平均策略、价值、判别器梯度。判别器梯度不裁剪。"""
+        params = chain(
+            self.actor.parameters(),
+            self.critic.parameters(),
+            self.amp_discriminator.parameters(),
+        )
+        if self.rnd:
+            params = chain(params, self.rnd.parameters())
+        reduce_gradients_in_buckets(params, self.gpu_world_size, self.grad_reduce_bucket_mb)

@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-# ruff: noqa: D400, D415, RUF002
+# ruff: file-ignore[missing-trailing-period, missing-terminal-punctuation, ambiguous-unicode-character-docstring]
 # Copyright (c) 2021-2026, ETH Zurich and NVIDIA CORPORATION
 # Copyright (c) 2022-2025, The Isaac Lab Project Developers.
 # Copyright (c) 2025-2026, The RoboLab Project Developers.
@@ -132,11 +132,13 @@ class AMPDiscriminator(nn.Module):
             raise ValueError(f"Expected {self.disc_obs_steps} discriminator steps, got {disc_obs.shape[1]}.")
         disc_obs_reshaped = disc_obs.reshape(-1, self.disc_obs_dim)
         normed_disc_obs = self.disc_obs_normalizer(disc_obs_reshaped)
+        # 与旧 AMPPPO 的 Normalizer 一致，归一化结果裁到 ±10。
+        normed_disc_obs = torch.clamp(normed_disc_obs, -10.0, 10.0)
         normed_disc_obs = normed_disc_obs.reshape(-1, self.disc_obs_steps, self.disc_obs_dim)
         return normed_disc_obs
 
     def update_normalization(self, disc_obs: torch.Tensor) -> None:
-        """使用策略特征更新运行均值和方差。"""
+        """用已经归一化的策略和专家特征更新运行统计。"""
         if disc_obs.ndim != 3:
             raise ValueError("Discriminator observations must have shape (num_envs, num_steps, dim).")
         if self.disc_obs_dim != disc_obs.shape[2]:
@@ -175,8 +177,7 @@ class AMPDiscriminator(nn.Module):
         was_training = self.training
         with torch.no_grad():
             self.eval()
-            disc_obs_reshaped = disc_obs.view(-1, self.disc_obs_dim)
-            normed_disc_obs = self.disc_obs_normalizer(disc_obs_reshaped)
+            normed_disc_obs = self.normalize_disc_obs(disc_obs)
             normed_disc_obs = normed_disc_obs.view(-1, self.disc_obs_steps * self.disc_obs_dim)
             disc_score = self.forward(normed_disc_obs)
             rew = 0

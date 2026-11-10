@@ -35,8 +35,8 @@ def build_amp() -> tuple[PPOAMP, TensorDict]:
         disc_obs_dim=3,
         disc_obs_steps=2,
         obs_groups=groups,
-        disc_trunk_weight_decay=0.0,
-        disc_linear_weight_decay=0.0,
+        disc_trunk_weight_decay=1e-3,
+        disc_linear_weight_decay=1e-1,
         disc_learning_rate=1e-3,
         grad_penalty_scale=10.0,
         step_dt=0.02,
@@ -72,23 +72,22 @@ def test_amp_update_and_checkpoint() -> None:
     assert restored.load(state, None, True)
     for k, v in restored.amp_discriminator.state_dict().items():
         torch.testing.assert_close(v, state["amp_discriminator_state_dict"][k])
-    assert restored.disc_optimizer.state_dict()["state"]
+    decays = {group["weight_decay"] for group in restored.optimizer.param_groups}
+    assert decays == {0.0, 1e-3, 1e-1}
 
 
-def test_terminal_observation_required_and_used() -> None:
-    """拒绝缺失终止状态的自动重置，提供终止状态后仅替换结束环境。"""
+def test_terminal_observation_repeats_pre_step_frame() -> None:
+    """回合结束时用步进前的策略特征顶替重置后的观测。"""
     alg, obs = build_amp()
     dones = torch.tensor([1, 0, 0, 0])
+    next_obs = obs.clone()
+    next_obs["disc"] = torch.full_like(obs["disc"], 7)
     with torch.no_grad():
         alg.act(obs)
-        with pytest.raises(ValueError, match="final_obs"):
-            alg.process_env_step(obs, torch.ones(4), dones, {})
-        final = obs.clone()
-        final["disc"] = torch.full_like(obs["disc"], 7)
-        alg.process_env_step(obs, torch.ones(4), dones, {"final_obs": final})
+        alg.process_env_step(next_obs, torch.ones(4), dones, {})
     stored = alg.policy_obs_buffer.buffer[:, -1]
-    torch.testing.assert_close(stored[0], final["disc"][0])
-    torch.testing.assert_close(stored[1:], obs["disc"][1:])
+    torch.testing.assert_close(stored[0], obs["disc"][0])
+    torch.testing.assert_close(stored[1:], next_obs["disc"][1:])
 
 
 @pytest.mark.parametrize("loss", list(LossType))

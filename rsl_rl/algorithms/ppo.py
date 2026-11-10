@@ -283,6 +283,9 @@ class PPO:
                     value_loss = (batch.returns - values).pow(2).mean()
 
                 loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
+                auxiliary_loss = self.auxiliary_loss()
+                if auxiliary_loss is not None:
+                    loss = loss + auxiliary_loss
 
                 # RND loss
                 rnd_loss = self.rnd.compute_loss(batch.observations[:original_batch_size]) if self.rnd else None  # type: ignore
@@ -309,6 +312,7 @@ class PPO:
             nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
+            self.after_auxiliary_step()
             # Apply the gradients for RND
             if self.rnd:
                 self.rnd.optimizer.step()
@@ -356,6 +360,14 @@ class PPO:
         self.storage.clear()
 
         return loss_dict
+
+    def auxiliary_loss(self) -> torch.Tensor | None:
+        """Optional loss added to the PPO backward. Discriminator overrides this."""
+        return None
+
+    def after_auxiliary_step(self) -> None:
+        """Hook after the shared optimizer step. Discriminator updates its normalizer here."""
+        return None
 
     def train_mode(self) -> None:
         """Set train mode for learnable models."""
