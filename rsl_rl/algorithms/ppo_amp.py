@@ -73,8 +73,8 @@ class PPOAMP(PPO):
             lr=amp_cfg["disc_learning_rate"],
         )
         self.disc_max_grad_norm = amp_cfg.get("disc_max_grad_norm", 1.0)
-        self.disc_obs_buffer = CircularBuffer(amp_cfg["disc_obs_buffer_size"], storage.num_envs, self.device)
-        self.disc_demo_obs_buffer = CircularBuffer(amp_cfg["disc_obs_buffer_size"], storage.num_envs, self.device)
+        self.policy_obs_buffer = CircularBuffer(amp_cfg["disc_obs_buffer_size"], storage.num_envs, self.device)
+        self.expert_obs_buffer = CircularBuffer(amp_cfg["disc_obs_buffer_size"], storage.num_envs, self.device)
         self._reward_statistics = []
 
     @staticmethod
@@ -89,21 +89,21 @@ class PPOAMP(PPO):
         """读取策略和专家历史，用终止前观测替换自动重置状态，组合奖励并保存样本。"""
         if dones.bool().any() and "final_obs" not in extras:
             raise ValueError("AMP 自动重置需要 extras['final_obs'] 提供终止前的完整观测。")
-        disc_obs = self.amp_discriminator.get_disc_obs(obs)
-        disc_demo_obs = self.amp_discriminator.get_disc_demo_obs(obs)
+        policy_obs = self.amp_discriminator.get_disc_obs(obs)
+        expert_obs = self.amp_discriminator.get_disc_demo_obs(obs)
         if "final_obs" in extras:
             final_obs = extras["final_obs"]
-            mask = dones.to(disc_obs.device).bool().reshape(-1, 1, 1)
-            final_disc_obs = self.amp_discriminator.get_disc_obs(final_obs).to(disc_obs.device)
-            final_demo_obs = self.amp_discriminator.get_disc_demo_obs(final_obs).to(disc_demo_obs.device)
-            disc_obs = torch.where(mask, final_disc_obs, disc_obs)
-            disc_demo_obs = torch.where(mask, final_demo_obs, disc_demo_obs)
+            mask = dones.to(policy_obs.device).bool().reshape(-1, 1, 1)
+            final_policy_obs = self.amp_discriminator.get_disc_obs(final_obs).to(policy_obs.device)
+            final_expert_obs = self.amp_discriminator.get_disc_demo_obs(final_obs).to(expert_obs.device)
+            policy_obs = torch.where(mask, final_policy_obs, policy_obs)
+            expert_obs = torch.where(mask, final_expert_obs, expert_obs)
         (self.style_rewards, self.disc_score) = self.amp_discriminator.predict_style_reward(
-            disc_obs, dt=self.amp_cfg["step_dt"]
+            policy_obs, dt=self.amp_cfg["step_dt"]
         )
         self.rewards_lerp = self.amp_discriminator.lerp_reward(rewards, self.style_rewards)
-        self.disc_obs_buffer.append(disc_obs)
-        self.disc_demo_obs_buffer.append(disc_demo_obs)
+        self.policy_obs_buffer.append(policy_obs)
+        self.expert_obs_buffer.append(expert_obs)
         self._reward_statistics.append(
             torch.stack((rewards.mean(), self.style_rewards.mean(), self.rewards_lerp.mean())).detach()
         )
@@ -141,31 +141,31 @@ class PPOAMP(PPO):
                 self.num_mini_batches,
                 self.num_learning_epochs,
             )
-            for buffer in (self.disc_obs_buffer, self.disc_demo_obs_buffer)
+            for buffer in (self.policy_obs_buffer, self.expert_obs_buffer)
         ]
         totals = torch.zeros(4, device=self.device)
         updates = 0
-        for policy_obs, demo_obs in zip(*generators):
+        for policy_obs, expert_obs in zip(*generators):
             with torch.no_grad():
                 policy_obs_norm = self.amp_discriminator.normalize_disc_obs(policy_obs)
-                demo_obs_norm = self.amp_discriminator.normalize_disc_obs(demo_obs)
+                expert_obs_norm = self.amp_discriminator.normalize_disc_obs(expert_obs)
             batch_size = policy_obs.shape[0]
             policy_score = self.amp_discriminator(policy_obs_norm.reshape(batch_size, -1))
-            demo_score = self.amp_discriminator(demo_obs_norm.reshape(batch_size, -1))
+            expert_score = self.amp_discriminator(expert_obs_norm.reshape(batch_size, -1))
             if self.loss_type == LossType.GAN:
                 loss = 0.5 * (
                     nn.functional.binary_cross_entropy_with_logits(policy_score, torch.zeros_like(policy_score))
-                    + nn.functional.binary_cross_entropy_with_logits(demo_score, torch.ones_like(demo_score))
+                    + nn.functional.binary_cross_entropy_with_logits(expert_score, torch.ones_like(expert_score))
                 )
             elif self.loss_type == LossType.LSGAN:
                 loss = 0.5 * (
                     nn.functional.mse_loss(policy_score, -torch.ones_like(policy_score))
-                    + nn.functional.mse_loss(demo_score, torch.ones_like(demo_score))
+                    + nn.functional.mse_loss(expert_score, torch.ones_like(expert_score))
                 )
             else:
-                loss = policy_score.mean() - demo_score.mean()
+                loss = policy_score.mean() - expert_score.mean()
             penalty = self.amp_discriminator.compute_grad_penalty(
-                demo_obs_norm.reshape(batch_size, -1),
+                expert_obs_norm.reshape(batch_size, -1),
                 self.amp_cfg["grad_penalty_scale"],
             )
             self.disc_optimizer.zero_grad()
@@ -179,7 +179,7 @@ class PPOAMP(PPO):
                 loss.detach(),
                 penalty.detach(),
                 policy_score.detach().mean(),
-                demo_score.detach().mean(),
+                expert_score.detach().mean(),
             ))
             updates += 1
         names = (

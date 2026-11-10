@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-# ruff: noqa: D400, D415, RUF002
+# ruff: file-ignore[missing-trailing-period, missing-terminal-punctuation, ambiguous-unicode-character-docstring]
 """验证 AMP 在当前 PPO 接口下的更新、终止观测和检查点恢复。"""
 
 import copy
@@ -86,7 +86,7 @@ def test_terminal_observation_required_and_used() -> None:
         final = obs.clone()
         final["disc"] = torch.full_like(obs["disc"], 7)
         alg.process_env_step(obs, torch.ones(4), dones, {"final_obs": final})
-    stored = alg.disc_obs_buffer.buffer[:, -1]
+    stored = alg.policy_obs_buffer.buffer[:, -1]
     torch.testing.assert_close(stored[0], final["disc"][0])
     torch.testing.assert_close(stored[1:], obs["disc"][1:])
 
