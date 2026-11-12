@@ -104,6 +104,8 @@ class PPOAMP(PPO):
             stand = stand_mask.to(device=self.style_rewards.device, dtype=torch.bool).reshape(-1)
             self.style_rewards = torch.where(stand, torch.zeros_like(self.style_rewards), self.style_rewards)
         self.rewards_lerp = self.amp_discriminator.lerp_reward(rewards, self.style_rewards)
+        self.amp_discriminator.update_normalization(policy_obs.detach())
+        self.amp_discriminator.update_normalization(expert_obs.detach())
         self.policy_obs_buffer.append(policy_obs)
         self.expert_obs_buffer.append(expert_obs)
         self._reward_statistics.append(
@@ -158,7 +160,6 @@ class PPOAMP(PPO):
         with torch.no_grad():
             policy_obs_norm = self.amp_discriminator.normalize_disc_obs(policy_obs)
             expert_obs_norm = self.amp_discriminator.normalize_disc_obs(expert_obs)
-        self._pending_norm = (policy_obs_norm, expert_obs_norm)
         batch_size = policy_obs.shape[0]
         policy_score = self.amp_discriminator(policy_obs_norm.reshape(batch_size, -1))
         expert_score = self.amp_discriminator(expert_obs_norm.reshape(batch_size, -1))
@@ -174,9 +175,9 @@ class PPOAMP(PPO):
             )
         else:
             loss = policy_score.mean() - expert_score.mean()
-        # 梯度惩罚打在归一化之前的专家特征上，系数沿用配置里的 10。
+        # 梯度惩罚与分类使用相同的归一化专家特征。
         penalty = self.amp_discriminator.compute_grad_penalty(
-            expert_obs.reshape(batch_size, -1),
+            expert_obs_norm.reshape(batch_size, -1),
             self.amp_cfg["grad_penalty_scale"],
         )
         self._disc_totals += torch.stack((
@@ -187,12 +188,6 @@ class PPOAMP(PPO):
         ))
         self._disc_updates += 1
         return loss + penalty
-
-    def after_auxiliary_step(self) -> None:
-        """用本批已经归一化的策略和专家特征更新统计量。"""
-        policy_obs_norm, expert_obs_norm = self._pending_norm
-        self.amp_discriminator.update_normalization(policy_obs_norm)
-        self.amp_discriminator.update_normalization(expert_obs_norm)
 
     def train_mode(self) -> None:
         """将 PPO 和判别器切换到训练模式。"""

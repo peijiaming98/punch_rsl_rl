@@ -84,7 +84,7 @@ def test_stand_mask_removes_style_reward() -> None:
         alg.act(obs)
         alg.process_env_step(obs, torch.ones(4), torch.zeros(4), {})
         alg.act(obs)
-        ungated = alg.style_rewards.clone()
+        ungated, _ = alg.amp_discriminator.predict_style_reward(obs["disc"], alg.amp_cfg["step_dt"])
         alg.process_env_step(obs, torch.ones(4), torch.zeros(4), {"amp_stand_mask": mask})
     torch.testing.assert_close(alg.style_rewards[mask], torch.zeros(2))
     torch.testing.assert_close(alg.style_rewards[~mask], ungated[~mask])
@@ -165,3 +165,42 @@ def test_amp_history_after_wraparound() -> None:
     torch.testing.assert_close(buffer[torch.tensor([99, 0])], torch.tensor([[2.0], [3.0]]))
     batch = next(buffer.mini_batch_generator(2, 1, 1))
     assert set(batch.flatten().tolist()) == {2.0, 3.0}
+
+
+def test_amp_normalization_uses_raw_rollout_once() -> None:
+    """统计原始采样且不随优化轮数重复计数。"""
+    alg, obs = build_amp()
+    obs["disc"] = torch.full_like(obs["disc"], 8.0)
+    obs["demo"] = torch.full_like(obs["demo"], 12.0)
+    alg.num_learning_epochs = 3
+    with torch.inference_mode():
+        for _ in range(2):
+            alg.act(obs)
+            alg.process_env_step(obs, torch.ones(4), torch.zeros(4), {})
+        alg.compute_returns(obs)
+    normalizer = alg.amp_discriminator.disc_obs_normalizer
+    assert normalizer.count.item() == 32
+    torch.testing.assert_close(normalizer.mean, torch.full((3,), 10.0))
+    before = copy.deepcopy(normalizer.state_dict())
+    alg.update()
+    for key, value in normalizer.state_dict().items():
+        torch.testing.assert_close(value, before[key])
+
+
+def test_amp_gradient_penalty_uses_normalized_expert(monkeypatch: pytest.MonkeyPatch) -> None:
+    """梯度惩罚与分类共享输入空间。"""
+    alg, obs = build_amp()
+    disc = alg.amp_discriminator
+    disc.update_normalization(torch.randn(4, 2, 3) * 3 + 7)
+    alg._disc_batch_iter = iter([(obs["disc"], obs["demo"])])
+    alg._disc_totals = torch.zeros(4)
+    alg._disc_updates = 0
+    expected = disc.normalize_disc_obs(obs["demo"]).flatten(1)
+    original = disc.compute_grad_penalty
+
+    def check_input(data: torch.Tensor, scale: float) -> torch.Tensor:
+        torch.testing.assert_close(data, expected)
+        return original(data, scale)
+
+    monkeypatch.setattr(disc, "compute_grad_penalty", check_input)
+    alg.auxiliary_loss().backward()

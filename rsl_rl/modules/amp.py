@@ -138,7 +138,7 @@ class AMPDiscriminator(nn.Module):
         return normed_disc_obs
 
     def update_normalization(self, disc_obs: torch.Tensor) -> None:
-        """用已经归一化的策略和专家特征更新运行统计。"""
+        """用原始策略和专家特征更新运行统计。"""
         if disc_obs.ndim != 3:
             raise ValueError("Discriminator observations must have shape (num_envs, num_steps, dim).")
         if self.disc_obs_dim != disc_obs.shape[2]:
