@@ -103,6 +103,10 @@ class PPOAMP(PPO):
         if stand_mask is not None:
             stand = stand_mask.to(device=self.style_rewards.device, dtype=torch.bool).reshape(-1)
             self.style_rewards = torch.where(stand, torch.zeros_like(self.style_rewards), self.style_rewards)
+            move = ~stand
+            extras.setdefault("log", {})["AMP/move_style_reward"] = (
+                self.style_rewards * move
+            ).sum().detach() / move.sum().clamp_min(1)
         self.rewards_lerp = self.amp_discriminator.lerp_reward(rewards, self.style_rewards)
         self.amp_discriminator.update_normalization(policy_obs.detach())
         self.amp_discriminator.update_normalization(expert_obs.detach())
